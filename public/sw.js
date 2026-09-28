@@ -9,7 +9,7 @@
  * - Cross-origin (fonts, etc.): pass through untouched.
  */
 
-const VERSION = "tdagent-v4";
+const VERSION = "tdagent-v5";
 const STATIC_CACHE = `${VERSION}-static`;
 const PAGE_CACHE = `${VERSION}-pages`;
 const IMAGE_CACHE = `${VERSION}-images`;

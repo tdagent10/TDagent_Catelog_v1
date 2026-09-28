@@ -1,6 +1,5 @@
 import { ProductImage } from "./product-image";
-import type { CatalogPhoto } from "@/lib/catalog-types";
-import type { Product } from "@/lib/catalog-data";
+import type { CatalogPhoto, Product } from "@/lib/catalog-types";
 
 /**
  * Tiny delete affordance: a very small 12px dot visually, with an invisible
@@ -14,7 +13,7 @@ export function ProductCard({
   onRemove,
 }: {
   product: Product;
-  onRemove?: (name: string) => void;
+  onRemove?: (id: string) => void;
 }) {
   return (
     <li className="min-w-0 rounded-xl border border-card-border bg-white p-1.5 sm:p-2">
@@ -23,7 +22,7 @@ export function ProductCard({
         {onRemove && (
           <button
             type="button"
-            onClick={() => onRemove(product.name)}
+            onClick={() => onRemove(product.id)}
             aria-label={`Remove ${product.name}`}
             className={TINY_X}
           >

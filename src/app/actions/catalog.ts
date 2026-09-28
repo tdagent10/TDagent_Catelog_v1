@@ -5,8 +5,10 @@ import { createServerClient, PHOTO_BUCKET } from "@/lib/supabase/server";
 import {
   mapCategory,
   mapPhoto,
+  mapProduct,
   type CatalogPhoto,
   type Category,
+  type Product,
 } from "@/lib/catalog-types";
 import { MAX_PHOTO_BYTES } from "@/lib/image-compress";
 
@@ -44,6 +46,40 @@ export async function fetchCategories(): Promise<Category[]> {
   });
   if (error) throw new Error(error.message);
   return asRows(data).map(mapCategory);
+}
+
+export async function fetchProducts(categoryId: string): Promise<Product[]> {
+  const supabase = createServerClient();
+  const { data, error } = await supabase.rpc("list_products", {
+    p_user_id: await requireUserId(),
+    p_category_id: categoryId,
+  });
+  if (error) throw new Error(error.message);
+  return asRows(data).map(mapProduct);
+}
+
+/**
+ * Deletes a product row for good.
+ *
+ * This used to be a client-side useState toggle, so a "deleted" sample came
+ * straight back on the next login. Now the row is gone for good.
+ */
+export async function deleteProductAction(
+  productId: string,
+): Promise<{ ok: boolean; error?: string }> {
+  const supabase = createServerClient();
+
+  const { error } = await supabase.rpc("delete_product", {
+    p_user_id: await requireUserId(),
+    p_id: productId,
+  });
+
+  if (error) {
+    console.error("delete_product failed:", error);
+    return { ok: false, error: "Could not delete that product." };
+  }
+
+  return { ok: true };
 }
 
 export async function fetchPhotos(categoryId: string): Promise<CatalogPhoto[]> {

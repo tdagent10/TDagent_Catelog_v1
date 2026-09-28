@@ -2,8 +2,8 @@ import { notFound } from "next/navigation";
 import type { Metadata } from "next";
 import { CatalogShell } from "@/components/catalog/catalog-shell";
 import { createServerClient } from "@/lib/supabase/server";
-import { mapCategory, mapPhoto } from "@/lib/catalog-types";
-import type { CatalogPhoto, Category } from "@/lib/catalog-types";
+import { mapCategory, mapPhoto, mapProduct } from "@/lib/catalog-types";
+import type { CatalogPhoto, Category, Product } from "@/lib/catalog-types";
 
 export async function generateMetadata({
   params,
@@ -69,23 +69,36 @@ export default async function SharePage({
   });
   const categories: Category[] = asRows(catData).map(mapCategory);
 
-  // Preload every category's photos so the view-only page needs no
-  // authenticated client calls at all.
-  const photoEntries = await Promise.all(
-    categories.map(async (c) => {
-      const { data } = await supabase.rpc("list_photos", {
-        p_user_id: userId,
-        p_category_id: c.id,
-      });
-      const photos: CatalogPhoto[] = asRows(data).map(mapPhoto);
-      return [c.id, photos] as const;
-    }),
-  );
+  // Preload every category's photos and products so the view-only page needs
+  // no authenticated client calls at all.
+  const [photoEntries, productEntries] = await Promise.all([
+    Promise.all(
+      categories.map(async (c) => {
+        const { data } = await supabase.rpc("list_photos", {
+          p_user_id: userId,
+          p_category_id: c.id,
+        });
+        const photos: CatalogPhoto[] = asRows(data).map(mapPhoto);
+        return [c.id, photos] as const;
+      }),
+    ),
+    Promise.all(
+      categories.map(async (c) => {
+        const { data } = await supabase.rpc("list_products", {
+          p_user_id: userId,
+          p_category_id: c.id,
+        });
+        const products: Product[] = asRows(data).map(mapProduct);
+        return [c.id, products] as const;
+      }),
+    ),
+  ]);
 
   return (
     <CatalogShell
       initialCategories={categories}
       initialPhotos={Object.fromEntries(photoEntries)}
+      initialProducts={Object.fromEntries(productEntries)}
       readOnly
     />
   );

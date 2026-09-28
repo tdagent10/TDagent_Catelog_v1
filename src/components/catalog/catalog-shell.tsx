@@ -9,13 +9,14 @@ import {
 } from "react";
 import { useFormStatus } from "react-dom";
 import { compressToJpeg, MAX_PHOTO_BYTES } from "@/lib/image-compress";
-import { CATEGORIES, type Product } from "@/lib/catalog-data";
-import type { CatalogPhoto, Category } from "@/lib/catalog-types";
+import type { CatalogPhoto, Category, Product } from "@/lib/catalog-types";
 import {
   createCategoryAction,
   deleteCategoryAction,
   deletePhotoAction,
+  deleteProductAction,
   fetchPhotos,
+  fetchProducts,
   uploadPhotoAction,
   type CreateCategoryState,
 } from "@/app/actions/catalog";
@@ -25,12 +26,8 @@ import { ShareQrModal } from "./share-qr-modal";
 import { getMyShareToken } from "@/app/actions/share";
 import { CameraIcon, PlusIcon, QrIcon } from "./icons";
 
-/** Placeholder products the UI ships with, keyed by category slug. */
-const PLACEHOLDER_PRODUCTS: Record<string, Product[]> = Object.fromEntries(
-  CATEGORIES.map((c) => [c.slug, c.products]),
-);
-
 const NO_PHOTOS: CatalogPhoto[] = [];
+const NO_PRODUCTS: Product[] = [];
 
 function AddSubmitButton() {
   const { pending } = useFormStatus();
@@ -50,6 +47,7 @@ export function CatalogShell({
   loadError = null,
   readOnly = false,
   initialPhotos,
+  initialProducts,
 }: {
   initialCategories: Category[];
   loadError?: string | null;
@@ -57,6 +55,8 @@ export function CatalogShell({
   readOnly?: boolean;
   /** Preloaded photos per category (used in read-only mode). */
   initialPhotos?: Record<string, CatalogPhoto[]>;
+  /** Preloaded products per category (used in read-only mode). */
+  initialProducts?: Record<string, Product[]>;
 }) {
   const [categories, setCategories] = useState<Category[]>(initialCategories);
   const [activeId, setActiveId] = useState<string | null>(
@@ -68,6 +68,13 @@ export function CatalogShell({
   const [photosState, setPhotosState] = useState<{
     id: string;
     list: CatalogPhoto[];
+  } | null>(null);
+
+  // Same shape and same reason for products: they belong to a category, and
+  // these used to be a hardcoded constant with a client-side hide set.
+  const [productsState, setProductsState] = useState<{
+    id: string;
+    list: Product[];
   } | null>(null);
 
   const [cameraOpen, setCameraOpen] = useState(false);
@@ -93,10 +100,6 @@ export function CatalogShell({
       setShareLoading(false);
     }
   }
-  const [hiddenPlaceholders, setHiddenPlaceholders] = useState<Set<string>>(
-    new Set(),
-  );
-
   const deleteCategory = async (id: string) => {
     const result = await deleteCategoryAction(id);
     if (!result.ok) return;
@@ -108,13 +111,39 @@ export function CatalogShell({
     }
   };
 
-  const removePlaceholder = (name: string) => {
-    setHiddenPlaceholders((prev) => {
-      const next = new Set(prev);
-      next.add(name);
-      return next;
-    });
-  };
+  /**
+   * Removes a product for good.
+   *
+   * The row is dropped from the grid immediately so the tap feels instant,
+   * then deleted server-side. If the delete fails the row is put back, so
+   * the screen never claims a product is gone while the database still has
+   * it and it reappears at the next login.
+   */
+  const removeProduct = useCallback(async (id: string) => {
+    const previous = productsState;
+    setProductsState((prev) =>
+      prev ? { ...prev, list: prev.list.filter((p) => p.id !== id) } : prev,
+    );
+    setCategories((prev) =>
+      prev.map((c) =>
+        c.id === activeId ? { ...c, productCount: Math.max(0, c.productCount - 1) } : c,
+      ),
+    );
+
+    const res = await deleteProductAction(id);
+    if (!res.ok) {
+      console.error("deleteProduct failed:", res.error);
+      setProductsState(previous);
+      setCategories((prev) =>
+        prev.map((c) =>
+          c.id === activeId
+            ? { ...c, productCount: c.productCount + 1 }
+            : c,
+        ),
+      );
+      setCaptureError(res.error ?? "Could not delete that product.");
+    }
+  }, [productsState, activeId]);
 
   // Always open the live-camera dialog first: it tries the real device camera
   // via getUserMedia (works on Windows, Android Chrome and iOS Safari over
@@ -135,8 +164,15 @@ export function CatalogShell({
       ? photosState.list
       : NO_PHOTOS;
 
-  // Photos for the selected category, fetched per selection.
-  // Skipped entirely in read-only mode: photos arrive preloaded.
+  const products = readOnly
+    ? (active ? (initialProducts?.[active.id] ?? NO_PRODUCTS) : NO_PRODUCTS)
+    : active && productsState?.id === active.id
+      ? productsState.list
+      : NO_PRODUCTS;
+
+  // Products and photos for the selected category, fetched per selection.
+  // Skipped entirely in read-only mode: photos arrive preloaded and a customer
+  // view has no editing controls to trigger a product fetch.
   useEffect(() => {
     if (!active || readOnly) return;
 
@@ -151,6 +187,17 @@ export function CatalogShell({
         if (!cancelled) {
           setPhotosState({ id: active.id, list: NO_PHOTOS });
           setCaptureError("Could not load photos for this category.");
+        }
+      });
+
+    fetchProducts(active.id)
+      .then((list) => {
+        if (!cancelled) setProductsState({ id: active.id, list });
+      })
+      .catch((err) => {
+        console.error("fetchProducts failed:", err);
+        if (!cancelled) {
+          setProductsState({ id: active.id, list: NO_PRODUCTS });
         }
       });
 
@@ -250,14 +297,9 @@ export function CatalogShell({
     });
   }, []);
 
-  const placeholders = active ? PLACEHOLDER_PRODUCTS[active.slug] : undefined;
-  const visiblePlaceholders = (placeholders ?? []).filter(
-    (p) => !hiddenPlaceholders.has(p.name),
-  );
-
-  // The count matches exactly what the grid below renders: visible
-  // placeholders plus captured photos.
-  const displayedCount = visiblePlaceholders.length + photos.length;
+  // The count matches exactly what the grid below renders: products from the
+  // database plus captured photos.
+  const displayedCount = products.length + photos.length;
 
   return (
     <div className="min-h-dvh bg-canvas">
@@ -406,13 +448,13 @@ export function CatalogShell({
                 )}
               </div>
 
-              {visiblePlaceholders.length + photos.length > 0 ? (
+              {products.length + photos.length > 0 ? (
                 <ul className="mt-4 grid grid-cols-2 gap-2.5 sm:mt-7 sm:grid-cols-3 sm:gap-5 xl:grid-cols-4">
-                  {visiblePlaceholders.map((product) => (
+                  {products.map((product) => (
                     <ProductCard
-                      key={product.name}
+                      key={product.id}
                       product={product}
-                      onRemove={readOnly ? undefined : removePlaceholder}
+                      onRemove={readOnly ? undefined : removeProduct}
                     />
                   ))}
                   {photos.map((photo) => (

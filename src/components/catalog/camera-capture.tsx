@@ -16,6 +16,10 @@ type Props = {
   onCapture: (source: Blob) => Promise<void> | void;
   busy: boolean;
   error: string | null;
+  /** Photos finished uploading in this session, shown in the counter. */
+  shots: number;
+  /** Uploads still in flight, so Done can wait for them to land. */
+  uploading: number;
 };
 
 const FAILURE_TEXT: Record<CameraFailure, string> = {
@@ -75,7 +79,15 @@ function playShutter(ctx: AudioContext | null) {
   }
 }
 
-export function CameraCapture({ open, onClose, onCapture, busy, error }: Props) {
+export function CameraCapture({
+  open,
+  onClose,
+  onCapture,
+  busy,
+  error,
+  shots,
+  uploading,
+}: Props) {
   const videoRef = useRef<HTMLVideoElement>(null);
   const streamRef = useRef<MediaStream | null>(null);
   const audioRef = useRef<AudioContext | null>(null);
@@ -331,7 +343,7 @@ export function CameraCapture({ open, onClose, onCapture, busy, error }: Props) 
           />
 
           {/* Top bar floats over the viewfinder. */}
-          <div className="absolute inset-x-0 top-0 flex items-start justify-between bg-gradient-to-b from-black/55 to-transparent px-4 pt-[max(0.75rem,env(safe-area-inset-top))] pb-8">
+          <div className="absolute inset-x-0 top-0 flex items-start justify-between gap-3 bg-gradient-to-b from-black/55 to-transparent px-4 pt-[max(0.75rem,env(safe-area-inset-top))] pb-8">
             <button
               type="button"
               onClick={onClose}
@@ -341,9 +353,33 @@ export function CameraCapture({ open, onClose, onCapture, busy, error }: Props) 
               ×
             </button>
 
-            <span className="rounded-full bg-black/45 px-3 py-1.5 text-xs font-semibold text-white/90 backdrop-blur-sm">
-              max 200KB
+            {/* Live count of this session, so the user knows what is banked. */}
+            <span className="flex items-center gap-2 rounded-full bg-black/45 px-3 py-1.5 text-xs font-semibold text-white/90 backdrop-blur-sm">
+              {shots > 0 && (
+                <span className="flex h-4 w-4 items-center justify-center rounded-full bg-white text-[10px] leading-none font-bold text-black">
+                  {shots}
+                </span>
+              )}
+              {shots === 0 ? "No photos yet" : uploading > 0 ? "Saving…" : "saved"}
             </span>
+          </div>
+
+          {/* Done: ends the session and returns to the catalog grid. Held
+              disabled while an upload is in flight so a photo can never be
+              dropped by closing on top of it. */}
+          <div className="absolute inset-x-0 bottom-[max(6.5rem,calc(env(safe-area-inset-bottom)+5.5rem))] flex justify-center">
+            <button
+              type="button"
+              onClick={onClose}
+              disabled={uploading > 0}
+              className="rounded-full bg-white px-7 py-3 text-[15px] font-bold text-black shadow-lg transition-opacity active:opacity-70 disabled:opacity-50"
+            >
+              {uploading > 0
+                ? "Saving…"
+                : shots > 0
+                  ? `Done (${shots})`
+                  : "Done"}
+            </button>
           </div>
 
           {/* Shutter cluster, modelled on a native camera app. */}
@@ -352,16 +388,18 @@ export function CameraCapture({ open, onClose, onCapture, busy, error }: Props) 
               type="button"
               onClick={() => fileInputRef.current?.click()}
               aria-label="Choose from photos"
-              className="h-12 w-12 shrink-0 rounded-lg border-2 border-white/85 text-[11px] font-semibold text-white active:scale-95"
+              className="flex h-12 w-12 shrink-0 items-center justify-center rounded-lg border-2 border-white/85 backdrop-blur-sm active:scale-95"
             >
-              <span className="sr-only">Choose from photos</span>
+              <CameraIcon className="h-5 w-5 text-white" />
             </button>
 
             <button
               type="button"
               onClick={grab}
               disabled={busy || !ready}
-              aria-label={ready ? "Capture photo" : "Camera starting…"}
+              aria-label={
+                ready ? "Capture photo" : "Camera starting…"
+              }
               className="flex h-[76px] w-[76px] shrink-0 items-center justify-center rounded-full border-4 border-white/90 bg-white/20 backdrop-blur-sm transition-transform active:scale-90 disabled:opacity-50"
             >
               <span
@@ -381,8 +419,10 @@ export function CameraCapture({ open, onClose, onCapture, busy, error }: Props) 
             </button>
           </div>
 
+          {/* Status and error sit above the Done button so they never
+              overlap the controls while shooting a burst. */}
           {!ready && (
-            <p className="absolute inset-x-0 bottom-[max(8.5rem,calc(env(safe-area-inset-bottom)+7rem))] text-center text-sm font-semibold text-white/85">
+            <p className="absolute inset-x-0 bottom-[max(10.5rem,calc(env(safe-area-inset-bottom)+9.5rem))] text-center text-sm font-semibold text-white/85">
               Starting camera…
             </p>
           )}
@@ -390,7 +430,7 @@ export function CameraCapture({ open, onClose, onCapture, busy, error }: Props) 
           {error && (
             <p
               role="alert"
-              className="absolute inset-x-4 bottom-[max(8.5rem,calc(env(safe-area-inset-bottom)+7rem))] rounded-xl bg-brand/90 px-4 py-3 text-center text-sm font-medium text-white"
+              className="absolute inset-x-4 bottom-[max(10.5rem,calc(env(safe-area-inset-bottom)+9.5rem))] rounded-xl bg-brand/90 px-4 py-3 text-center text-sm font-medium text-white"
             >
               {error}
             </p>

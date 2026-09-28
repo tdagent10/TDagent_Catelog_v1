@@ -176,9 +176,21 @@ export function CatalogShell({
     setAdding(false);
   }, [addState]);
 
+  // Uploads still in flight. A capture session can shoot several photos back
+  // to back, so this counts concurrent work rather than a single boolean --
+  // closing the camera must not abandon an upload that is mid-request.
+  const [pendingUploads, setPendingUploads] = useState(0);
+  // Photos taken during the current session, for the counter in the camera UI.
+  const [sessionShots, setSessionShots] = useState(0);
+
   async function handleCapture(source: Blob) {
     if (!active) return;
+    // The category is pinned for the whole session: the camera covers the
+    // screen, so it cannot change mid-session, but capture the id up front
+    // rather than reading `active` again after two awaits.
+    const categoryId = active.id;
     setCaptureError(null);
+    setPendingUploads((n) => n + 1);
 
     try {
       const compressed = await compressToJpeg(source, MAX_PHOTO_BYTES);
@@ -187,7 +199,7 @@ export function CatalogShell({
       });
 
       const result = await uploadPhotoAction(
-        active.id,
+        categoryId,
         file,
         compressed.width,
         compressed.height,
@@ -199,20 +211,31 @@ export function CatalogShell({
       }
 
       setPhotosState((prev) => {
-        const base = prev?.id === active.id ? prev.list : NO_PHOTOS;
-        return { id: active.id, list: [result.photo, ...base] };
+        const base = prev?.id === categoryId ? prev.list : NO_PHOTOS;
+        return { id: categoryId, list: [result.photo, ...base] };
       });
       setCategories((prev) =>
         prev.map((c) =>
-          c.id === active.id ? { ...c, photoCount: c.photoCount + 1 } : c,
+          c.id === categoryId ? { ...c, photoCount: c.photoCount + 1 } : c,
         ),
       );
-      setCameraOpen(false);
+      setSessionShots((n) => n + 1);
+      // Deliberately NOT closing the camera: a session lasts until the user
+      // taps Done, so several angles of one garment can be shot in a row.
     } catch (err) {
       console.error("handleCapture failed:", err);
       setCaptureError("Could not process that photo.");
+    } finally {
+      setPendingUploads((n) => Math.max(0, n - 1));
     }
   }
+
+  // Leaves the camera and resets the per-session counter.
+  const closeCamera = () => {
+    setCameraOpen(false);
+    setSessionShots(0);
+    setPendingUploads(0);
+  };
 
   const removePhoto = useCallback((id: string) => {
     setPhotosState((prev) =>
@@ -433,10 +456,12 @@ export function CatalogShell({
         <CameraCapture
           key={cameraOpen ? "camera-open" : "camera-closed"}
           open={cameraOpen}
-          onClose={() => setCameraOpen(false)}
+          onClose={closeCamera}
           onCapture={handleCapture}
           busy={false}
           error={captureError}
+          shots={sessionShots}
+          uploading={pendingUploads}
         />
       )}
 

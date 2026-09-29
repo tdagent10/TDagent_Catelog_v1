@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import { CameraIcon } from "./icons";
+import { CameraIcon, GalleryIcon } from "./icons";
 
 type CameraFailure =
   | "insecure"
@@ -303,10 +303,19 @@ export function CameraCapture({
       });
   };
 
+  /**
+   * Hands every selected file to the caller, one call per photo.
+   *
+   * The gallery input is `multiple`, so picking twenty shots produces twenty
+   * captures rather than one. The camera input is deliberately left single:
+   * adding `multiple` alongside `capture` makes several Android builds open the
+   * picker instead of the camera, which would break the one-shot path.
+   */
   const pick = (input: HTMLInputElement | null) => {
-    const file = input?.files?.[0];
+    const files = input?.files ? Array.from(input.files) : [];
+    // Reset first so re-picking the same photo still fires a change event.
     if (input) input.value = "";
-    if (file) onCapture(file);
+    files.forEach((file) => onCapture(file));
   };
 
   // Any first touch unlocks audio for iOS, so the shutter is audible even on
@@ -396,10 +405,11 @@ export function CameraCapture({
             <button
               type="button"
               onClick={() => fileInputRef.current?.click()}
-              aria-label="Choose from photos"
+              aria-label="Choose photos from your device"
+              title="Choose photos"
               className="flex h-12 w-12 shrink-0 items-center justify-center rounded-lg border-2 border-white/85 backdrop-blur-sm active:scale-95"
             >
-              <CameraIcon className="h-5 w-5 text-white" />
+              <GalleryIcon className="h-5 w-5 text-white" />
             </button>
 
             <button
@@ -474,12 +484,31 @@ export function CameraCapture({
               type="button"
               onClick={() => fileInputRef.current?.click()}
               disabled={busy}
-              className="rounded-lg border border-white/30 px-4 py-3 text-[15px] font-semibold text-white active:bg-white/10 disabled:opacity-50"
+              className="flex items-center justify-center gap-2 rounded-lg border border-white/30 px-4 py-3 text-[15px] font-semibold text-white active:bg-white/10 disabled:opacity-50"
             >
-              Choose a file
+              <GalleryIcon className="h-5 w-5" />
+              Choose photos
             </button>
+
+            {/* Same escape hatch as the live view: the session ends here, not
+                on the first photo. */}
+            <button
+              type="button"
+              onClick={onClose}
+              disabled={uploading > 0}
+              className="mt-1 rounded-lg px-4 py-3 text-[15px] font-semibold text-white/70 active:bg-white/10 disabled:opacity-40"
+            >
+              {uploading > 0
+                ? "Saving…"
+                : shots > 0
+                  ? `Done (${shots})`
+                  : "Cancel"}
+            </button>
+
             <p className="pt-1 text-center text-xs font-medium text-white/40">
-              Photos are compressed to under 200KB
+              You can pick several photos at once.
+              <br />
+              Each is compressed to under 200KB
             </p>
           </div>
         </div>
@@ -499,6 +528,8 @@ export function CameraCapture({
         ref={fileInputRef}
         type="file"
         accept="image/*"
+        // Multi-select: a whole batch of product shots can be added in one go.
+        multiple
         tabIndex={-1}
         aria-hidden="true"
         className="pointer-events-none fixed bottom-0 left-0 h-px w-px opacity-0"

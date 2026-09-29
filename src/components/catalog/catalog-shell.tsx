@@ -373,41 +373,50 @@ export function CatalogShell({
     setAdding(false);
   }, [addState]);
 
-  // Uploads still in flight. A capture session can shoot several photos back
-  // to back, so this counts concurrent work rather than a single boolean --
-  // closing the camera must not abandon an upload that is mid-request.
+  // Uploads still in flight, including any waiting in the queue below. Closing
+  // the camera must not abandon one, so the counter drives the Done button.
   const [pendingUploads, setPendingUploads] = useState(0);
-  // Photos taken during the current session, for the counter in the camera UI.
+  // Photos added during the current session, for the counter in the camera UI.
   const [sessionShots, setSessionShots] = useState(0);
 
-  async function handleCapture(source: Blob | ImageBitmap) {
-    if (!active) return;
-    // The category is pinned for the whole session: the camera covers the
-    // screen, so it cannot change mid-session, but capture the id up front
-    // rather than reading `active` again after two awaits.
-    const categoryId = active.id;
-    setCaptureError(null);
-    setPendingUploads((n) => n + 1);
+  /**
+   * A capped upload queue.
+   *
+   * Multi-select means one tap can hand over twenty photos at once. Firing all
+   * of them together saturates a phone's connection and gets the whole batch
+   * throttled, which is slower than going three at a time. A small window
+   * keeps the pipe full without fighting the network.
+   */
+  const UPLOAD_CONCURRENCY = 3;
+  const queueRef = useRef<Array<() => Promise<void>>>([]);
+  const activeUploadsRef = useRef(0);
+  const pumpRef = useRef<() => void>(() => {});
 
-    // Placeholder in the grid straight away. An ImageBitmap has no URL, so it
-    // is drawn to a small canvas for the preview only -- that is cheap compared
-    // with the encode we are about to do, and it is the difference between the
-    // shutter appearing to work and appearing to hang.
-    const pendingId = `pending-${crypto.randomUUID()}`;
-    let previewUrl: string | null = null;
-    try {
-      const preview = await renderPreview(source);
-      if (preview) {
-        previewUrl = URL.createObjectURL(preview);
-        setPendingPhotos((prev) => [
-          { id: pendingId, categoryId, url: previewUrl as string },
-          ...prev,
-        ]);
+  useEffect(() => {
+    const pump = () => {
+      while (
+        activeUploadsRef.current < UPLOAD_CONCURRENCY &&
+        queueRef.current.length > 0
+      ) {
+        const task = queueRef.current.shift();
+        if (!task) break;
+        activeUploadsRef.current++;
+        void task().finally(() => {
+          activeUploadsRef.current--;
+          pump();
+        });
       }
-    } catch {
-      // A missing preview is cosmetic; the upload still proceeds.
-    }
+    };
+    pumpRef.current = pump;
+  }, []);
 
+  /** Runs one photo through compress + upload + cache update. */
+  async function processCapture(
+    categoryId: string,
+    source: Blob | ImageBitmap,
+    pendingId: string,
+    previewUrl: string | null,
+  ) {
     try {
       const compressed = await compressToJpeg(source, MAX_PHOTO_BYTES);
       const file = new File([compressed.blob], "photo.jpg", {
@@ -422,13 +431,9 @@ export function CatalogShell({
       );
 
       if (!result.ok) {
-        if (previewUrl) dropPending(pendingId);
         setCaptureError(result.error);
         return;
       }
-
-      // Replace the local preview with the stored photo.
-      if (previewUrl) dropPending(pendingId);
 
       patchCache(categoryId, (c) => ({
         ...c,
@@ -440,22 +445,67 @@ export function CatalogShell({
         ),
       );
       setSessionShots((n) => n + 1);
-      // Deliberately NOT closing the camera: a session lasts until the user
-      // taps Done, so several angles of one garment can be shot in a row.
     } catch (err) {
-      console.error("handleCapture failed:", err);
-      if (previewUrl) dropPending(pendingId);
+      console.error("processCapture failed:", err);
       setCaptureError("Could not process that photo.");
     } finally {
+      // The local preview has done its job either way: replaced by the stored
+      // photo on success, or removed so the grid does not keep a dead entry.
+      if (previewUrl) dropPending(pendingId);
       setPendingUploads((n) => Math.max(0, n - 1));
     }
   }
 
-  // Leaves the camera and resets the per-session counter.
+  /**
+   * Accepts one photo from either source and queues it.
+   *
+   * Not async: the picker calls this once per selected file in a tight loop, so
+   * each capture is placed in the grid independently and none of them waits on
+   * the others.
+   */
+  function handleCapture(source: Blob | ImageBitmap) {
+    if (!active) return;
+    // The category is pinned for the whole session: the camera covers the
+    // screen, so it cannot change mid-session, but capture the id up front
+    // rather than reading `active` again after two awaits.
+    const categoryId = active.id;
+    setCaptureError(null);
+    setPendingUploads((n) => n + 1);
+
+    const pendingId = `pending-${crypto.randomUUID()}`;
+
+    // Placeholder in the grid straight away. An ImageBitmap has no URL, so it
+    // is drawn to a small canvas for the preview only -- that is cheap compared
+    // with the encode we are about to do, and it is the difference between the
+    // shutter appearing to work and appearing to hang.
+    let previewUrl: string | null = null;
+    void renderPreview(source)
+      .then((preview) => {
+        if (!preview) return;
+        previewUrl = URL.createObjectURL(preview);
+        const url = previewUrl;
+        setPendingPhotos((prev) => [
+          { id: pendingId, categoryId, url },
+          ...prev,
+        ]);
+      })
+      .catch(() => {
+        // A missing preview is cosmetic; the upload still proceeds.
+      })
+      .finally(() => {
+        queueRef.current.push(() =>
+          processCapture(categoryId, source, pendingId, previewUrl),
+        );
+        pumpRef.current();
+      });
+  }
+
+  // Leaves the camera. The upload queue is deliberately not reset: captures
+  // still in flight finish and land in the grid, because the shell stays
+  // mounted and zeroing the counter would hide work that is still arriving.
   const closeCamera = () => {
     setCameraOpen(false);
     setSessionShots(0);
-    setPendingUploads(0);
   };
 
   const removePhoto = useCallback(

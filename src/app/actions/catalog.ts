@@ -178,63 +178,134 @@ export async function createCategoryAction(
   };
 }
 
-export async function uploadPhotoAction(
+export type PhotoUpload = {
+  file: File;
+  width: number;
+  height: number;
+};
+
+export type PhotoUploadResult = {
+  photo: CatalogPhoto;
+  /** Storage path, so a partial failure can be cleaned up by the caller. */
+  path: string;
+};
+
+/**
+ * Saves a batch of photos.
+ *
+ * Saving one photo cost two sequential round trips: the Storage upload, then
+ * the metadata RPC. The byte transfers have to stay per-photo, but they are
+ * independent, so they go up in parallel; the metadata insert is collapsed
+ * into a single call for the whole batch. Six photos therefore cost six
+ * parallel transfers plus one round trip, rather than twelve sequential ones.
+ *
+ * A photo that fails validation is reported and skipped rather than failing
+ * the batch, so one oversized file cannot discard the photos around it.
+ */
+export async function uploadPhotosAction(
   categoryId: string,
-  file: File,
-  width: number,
-  height: number,
-): Promise<{ ok: true; photo: CatalogPhoto } | { ok: false; error: string }> {
-  if (!ALLOWED_TYPES.includes(file.type)) {
-    return { ok: false, error: "Only JPEG, PNG or WebP photos are allowed." };
-  }
-  if (file.size > MAX_PHOTO_BYTES) {
-    return {
-      ok: false,
-      error: `Photo is ${Math.round(file.size / 1024)}KB, over the 200KB limit.`,
-    };
-  }
+  uploads: PhotoUpload[],
+): Promise<{ photos: PhotoUploadResult[]; errors: string[] }> {
+  if (uploads.length === 0) return { photos: [], errors: [] };
 
   const supabase = createServerClient();
   const userId = await requireUserId();
-  const path = `${userId}/${categoryId}/${crypto.randomUUID()}.jpg`;
+  const errors: string[] = [];
 
-  const { error: uploadError } = await supabase.storage
-    .from(PHOTO_BUCKET)
-    .upload(path, file, { contentType: file.type, upsert: false });
+  // Validate before spending any bandwidth on a photo that cannot be stored.
+  const accepted: { path: string; file: File; width: number; height: number }[] =
+    [];
 
-  if (uploadError) {
-    console.error("photo upload failed:", uploadError);
-    return { ok: false, error: "Could not save the photo. Please try again." };
+  for (const { file, width, height } of uploads) {
+    if (!ALLOWED_TYPES.includes(file.type)) {
+      errors.push("Only JPEG, PNG or WebP photos are allowed.");
+      continue;
+    }
+    if (file.size > MAX_PHOTO_BYTES) {
+      errors.push(
+        `A photo is ${Math.round(file.size / 1024)}KB, over the 200KB limit.`,
+      );
+      continue;
+    }
+    accepted.push({
+      path: `${userId}/${categoryId}/${crypto.randomUUID()}.jpg`,
+      file,
+      width,
+      height,
+    });
   }
 
-  const { data, error } = await supabase.rpc("add_photo", {
+  if (accepted.length === 0) return { photos: [], errors };
+
+  // Parallel transfers: these compete for bandwidth but not for latency, so a
+  // burst finishes in roughly the time of its slowest single upload.
+  const uploaded = await Promise.all(
+    accepted.map(async (item) => {
+      const { error } = await supabase.storage
+        .from(PHOTO_BUCKET)
+        .upload(item.path, item.file, {
+          contentType: item.file.type,
+          upsert: false,
+        });
+      return error ? { ...item, ok: false as const, error } : { ...item, ok: true as const };
+    }),
+  );
+
+  const good = uploaded.filter((u) => u.ok);
+  const badPaths = uploaded
+    .filter((u) => !u.ok)
+    .map((u) => {
+      console.error("photo upload failed:", u.error);
+      return u.path;
+    });
+
+  if (badPaths.length > 0) {
+    errors.push("Some photos could not be saved. Please try again.");
+  }
+
+  if (good.length === 0) return { photos: [], errors };
+
+  const { data, error } = await supabase.rpc("add_photos", {
     p_user_id: userId,
     p_category_id: categoryId,
-    p_storage_path: path,
-    p_bytes: file.size,
-    p_width: width,
-    p_height: height,
+    p_items: good.map((g) => ({
+      storagePath: g.path,
+      bytes: g.file.size,
+      width: g.width,
+      height: g.height,
+    })),
   });
 
   if (error) {
-    // Roll the object back so storage and the table cannot drift apart.
-    await supabase.storage.from(PHOTO_BUCKET).remove([path]);
-    console.error("add_photo failed:", error);
-    return {
-      ok: false,
-      error: error.message.includes("200KB")
-        ? "That photo is over the 200KB limit."
-        : "Could not save the photo. Please try again.",
-    };
+    // Roll the objects back so storage and the table cannot drift apart.
+    await supabase.storage.from(PHOTO_BUCKET).remove(good.map((g) => g.path));
+    console.error("add_photos failed:", error);
+    errors.push(
+      error.message.includes("200KB")
+        ? "A photo is over the 200KB limit."
+        : "Could not save the photos. Please try again.",
+    );
+    return { photos: [], errors };
   }
 
-  const row = asRows(data)[0];
-  if (!row) {
-    await supabase.storage.from(PHOTO_BUCKET).remove([path]);
-    return { ok: false, error: "Could not save the photo. Please try again." };
+  const rows = asRows(data);
+  if (rows.length !== good.length) {
+    // The insert and the stored objects must agree; if they do not, the
+    // objects are removed rather than left orphaned in the bucket.
+    await supabase.storage
+      .from(PHOTO_BUCKET)
+      .remove(good.map((g) => g.path));
+    errors.push("Could not save the photos. Please try again.");
+    return { photos: [], errors };
   }
 
-  return { ok: true, photo: mapPhoto(row) };
+  return {
+    photos: rows.map((row, i) => ({
+      photo: mapPhoto(row),
+      path: good[i].path,
+    })),
+    errors,
+  };
 }
 
 export async function deletePhotoAction(

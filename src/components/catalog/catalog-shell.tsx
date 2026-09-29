@@ -16,7 +16,7 @@ import {
   deletePhotoAction,
   deleteProductAction,
   fetchCategoryContent,
-  uploadPhotoAction,
+  uploadPhotosAction,
   type CreateCategoryState,
 } from "@/app/actions/catalog";
 import { PendingPhotoCard, PhotoCard, ProductCard } from "./product-card";
@@ -373,95 +373,152 @@ export function CatalogShell({
     setAdding(false);
   }, [addState]);
 
-  // Uploads still in flight, including any waiting in the queue below. Closing
-  // the camera must not abandon one, so the counter drives the Done button.
+  // Uploads still in flight, including anything compressed but not yet
+  // flushed. Closing the camera must not abandon one, so this drives Done.
   const [pendingUploads, setPendingUploads] = useState(0);
   // Photos added during the current session, for the counter in the camera UI.
   const [sessionShots, setSessionShots] = useState(0);
 
   /**
-   * A capped upload queue.
+   * Photos compressed and waiting to be sent.
    *
-   * Multi-select means one tap can hand over twenty photos at once. Firing all
-   * of them together saturates a phone's connection and gets the whole batch
-   * throttled, which is slower than going three at a time. A small window
-   * keeps the pipe full without fighting the network.
+   * A rapid burst accumulates here and leaves as one batch, so shooting six
+   * photos costs one metadata round trip rather than six. The delay is what
+   * makes the batching work: a photo captured while the previous batch is in
+   * flight joins the next one for free.
    */
-  const UPLOAD_CONCURRENCY = 3;
-  const queueRef = useRef<Array<() => Promise<void>>>([]);
-  const activeUploadsRef = useRef(0);
-  const pumpRef = useRef<() => void>(() => {});
+  type ReadyUpload = {
+    categoryId: string;
+    pendingId: string;
+    previewUrl: string | null;
+    file: File;
+    width: number;
+    height: number;
+  };
 
-  useEffect(() => {
-    const pump = () => {
-      while (
-        activeUploadsRef.current < UPLOAD_CONCURRENCY &&
-        queueRef.current.length > 0
-      ) {
-        const task = queueRef.current.shift();
-        if (!task) break;
-        activeUploadsRef.current++;
-        void task().finally(() => {
-          activeUploadsRef.current--;
-          pump();
-        });
-      }
-    };
-    pumpRef.current = pump;
-  }, []);
+  const readyQueueRef = useRef<ReadyUpload[]>([]);
+  const flushingRef = useRef(false);
+  const flushTimerRef = useRef<number | null>(null);
 
-  /** Runs one photo through compress + upload + cache update. */
-  async function processCapture(
-    categoryId: string,
-    source: Blob | ImageBitmap,
-    pendingId: string,
-    previewUrl: string | null,
-  ) {
+  /**
+   * Batch ceiling.
+   *
+   * Next.js caps a Server Action request body at 1MB by default. Photos are up
+   * to 200KB each, so a batch has to stay well under that or the request is
+   * rejected outright and the whole burst is lost. Roughly three max-size
+   * photos fit; in practice these are 20-100KB, so a batch carries many more.
+   */
+  const MAX_BATCH_BYTES = 640 * 1024;
+  const MAX_BATCH_COUNT = 12;
+
+  /**
+   * Sends everything currently queued as one batch.
+   *
+   * A plain function rather than a useCallback: it is only ever called from
+   * event handlers, never handed to a memoised child, so memoising it would
+   * only add dependency bookkeeping. The mutual recursion between this and
+   * scheduleFlush runs through refs, which keeps both stable.
+   */
+  async function flushUploads() {
+    if (flushingRef.current) return;
+    const queued = readyQueueRef.current;
+    if (queued.length === 0) return;
+
+    readyQueueRef.current = [];
+    flushingRef.current = true;
+
+    // A session is normally one category, but grouping keeps a single RPC call
+    // per category even if the selection ever spans two.
+    const byCategory = new Map<string, ReadyUpload[]>();
+    for (const item of queued) {
+      const list = byCategory.get(item.categoryId);
+      if (list) list.push(item);
+      else byCategory.set(item.categoryId, [item]);
+    }
+
     try {
-      const compressed = await compressToJpeg(source, MAX_PHOTO_BYTES);
-      const file = new File([compressed.blob], "photo.jpg", {
-        type: "image/jpeg",
-      });
+      for (const [categoryId, items] of byCategory) {
+        const { photos, errors } = await uploadPhotosAction(
+          categoryId,
+          items.map((i) => ({
+            file: i.file,
+            width: i.width,
+            height: i.height,
+          })),
+        );
 
-      const result = await uploadPhotoAction(
-        categoryId,
-        file,
-        compressed.width,
-        compressed.height,
-      );
+        if (photos.length > 0) {
+          // Reversed so the earliest photo of the batch ends up first, which
+          // is the order list_products returns (newest capture first).
+          const added = photos.map((p) => p.photo).reverse();
+          patchCache(categoryId, (c) => ({
+            ...c,
+            photos: [...added, ...c.photos],
+          }));
+          setCategories((prev) =>
+            prev.map((c) =>
+              c.id === categoryId
+                ? { ...c, photoCount: c.photoCount + photos.length }
+                : c,
+            ),
+          );
+          setSessionShots((n) => n + photos.length);
+        }
 
-      if (!result.ok) {
-        setCaptureError(result.error);
-        return;
+        items.forEach((item) => {
+          if (item.previewUrl) dropPending(item.pendingId);
+        });
+        setPendingUploads((n) => Math.max(0, n - items.length));
+
+        if (errors.length > 0) setCaptureError(errors[0]);
       }
-
-      patchCache(categoryId, (c) => ({
-        ...c,
-        photos: [result.photo, ...c.photos],
-      }));
-      setCategories((prev) =>
-        prev.map((c) =>
-          c.id === categoryId ? { ...c, photoCount: c.photoCount + 1 } : c,
-        ),
-      );
-      setSessionShots((n) => n + 1);
     } catch (err) {
-      console.error("processCapture failed:", err);
-      setCaptureError("Could not process that photo.");
+      console.error("flushUploads failed:", err);
+      queued.forEach((item) => {
+        if (item.previewUrl) dropPending(item.pendingId);
+      });
+      setPendingUploads((n) => Math.max(0, n - queued.length));
+      setCaptureError("Could not save the photos. Please try again.");
     } finally {
-      // The local preview has done its job either way: replaced by the stored
-      // photo on success, or removed so the grid does not keep a dead entry.
-      if (previewUrl) dropPending(pendingId);
-      setPendingUploads((n) => Math.max(0, n - 1));
+      flushingRef.current = false;
+      // Anything that arrived mid-flight goes out as the next batch.
+      if (readyQueueRef.current.length > 0) scheduleFlush();
     }
   }
+
+  /** Queues a flush, collapsing a burst into one batch. */
+  function scheduleFlush() {
+    if (flushingRef.current || flushTimerRef.current !== null) return;
+    flushTimerRef.current = window.setTimeout(() => {
+      flushTimerRef.current = null;
+      void flushUploads();
+    }, 150);
+  }
+
+  /** Sends a photo immediately, bypassing the batching delay. */
+  function flushNow() {
+    if (flushTimerRef.current !== null) {
+      window.clearTimeout(flushTimerRef.current);
+      flushTimerRef.current = null;
+    }
+    void flushUploads();
+  }
+
+  // A timer left running after the camera closes would be a stray async
+  // update; clear it on unmount.
+  useEffect(() => {
+    return () => {
+      if (flushTimerRef.current !== null) {
+        window.clearTimeout(flushTimerRef.current);
+      }
+    };
+  }, []);
 
   /**
    * Accepts one photo from either source and queues it.
    *
-   * Not async: the picker calls this once per selected file in a tight loop, so
-   * each capture is placed in the grid independently and none of them waits on
-   * the others.
+   * Not async: the picker calls this once per selected file in a tight loop,
+   * and the shutter must return to ready immediately, so nothing here waits.
    */
   function handleCapture(source: Blob | ImageBitmap) {
     if (!active) return;
@@ -475,8 +532,8 @@ export function CatalogShell({
     const pendingId = `pending-${crypto.randomUUID()}`;
 
     // Placeholder in the grid straight away. An ImageBitmap has no URL, so it
-    // is drawn to a small canvas for the preview only -- that is cheap compared
-    // with the encode we are about to do, and it is the difference between the
+    // is drawn to a small canvas for the preview only -- that is cheap next to
+    // the encode we are about to do, and it is the difference between the
     // shutter appearing to work and appearing to hang.
     let previewUrl: string | null = null;
     void renderPreview(source)
@@ -493,19 +550,46 @@ export function CatalogShell({
         // A missing preview is cosmetic; the upload still proceeds.
       })
       .finally(() => {
-        queueRef.current.push(() =>
-          processCapture(categoryId, source, pendingId, previewUrl),
-        );
-        pumpRef.current();
+        void compressToJpeg(source, MAX_PHOTO_BYTES)
+          .then((compressed) => {
+            const item: ReadyUpload = {
+              categoryId,
+              pendingId,
+              previewUrl,
+              file: new File([compressed.blob], "photo.jpg", {
+                type: "image/jpeg",
+              }),
+              width: compressed.width,
+              height: compressed.height,
+            };
+            readyQueueRef.current.push(item);
+
+            // Flush straight away once a batch is full, otherwise let the
+            // short timer gather whatever else is on its way.
+            const queued = readyQueueRef.current;
+            const bytes = queued.reduce((sum, i) => sum + i.file.size, 0);
+            if (bytes >= MAX_BATCH_BYTES || queued.length >= MAX_BATCH_COUNT) {
+              flushNow();
+            } else {
+              scheduleFlush();
+            }
+          })
+          .catch((err) => {
+            console.error("compress failed:", err);
+            if (previewUrl) dropPending(pendingId);
+            setPendingUploads((n) => Math.max(0, n - 1));
+            setCaptureError("Could not process that photo.");
+          });
       });
   }
 
-  // Leaves the camera. The upload queue is deliberately not reset: captures
-  // still in flight finish and land in the grid, because the shell stays
-  // mounted and zeroing the counter would hide work that is still arriving.
+  // Leaves the camera. Anything already compressed is sent on the way out so
+  // the grid is complete the moment the camera closes, and photos still being
+  // compressed land as they finish -- the shell stays mounted either way.
   const closeCamera = () => {
     setCameraOpen(false);
     setSessionShots(0);
+    flushNow();
   };
 
   const removePhoto = useCallback(

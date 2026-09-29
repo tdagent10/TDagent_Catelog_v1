@@ -28,6 +28,32 @@ const asRows = (data: unknown): Row[] =>
   Array.isArray(data) ? (data as Row[]) : [];
 
 /**
+ * Reads a jsonb value out of an RPC result.
+ *
+ * A Postgres function returning a scalar `jsonb` comes back from PostgREST as
+ * the bare value, not wrapped in a row object like a `returns table` function
+ * is. Treating it as rows silently yields nothing, which shows up as an empty
+ * catalog rather than an error, so both shapes are handled here.
+ */
+function asJsonObject(data: unknown): Row {
+  if (data && typeof data === "object" && !Array.isArray(data)) {
+    return data as Row;
+  }
+  return asRows(data)[0] ?? {};
+}
+
+/** Reads a json array out of an RPC result, tolerating either shape. */
+function asJsonArray(value: unknown): Row[] {
+  if (value && typeof value === "object" && !Array.isArray(value)) {
+    // Some builds nest the payload under the function's return name.
+    const nested = (value as Row)[Object.keys(value as Row)[0]];
+    if (Array.isArray(nested)) return nested as Row[];
+    return [];
+  }
+  return Array.isArray(value) ? (value as Row[]) : [];
+}
+
+/**
  * The signed-in user's id, taken from the session cookie set at login. Every
  * catalog call is scoped through this, so the client never supplies a user id
  * and one mobile number cannot reach another's catalog through the UI.
@@ -46,6 +72,37 @@ export async function fetchCategories(): Promise<Category[]> {
   });
   if (error) throw new Error(error.message);
   return asRows(data).map(mapCategory);
+}
+
+export type CategoryContent = {
+  products: Product[];
+  photos: CatalogPhoto[];
+};
+
+/**
+ * A category's products and photos in one round trip.
+ *
+ * These used to be two separate calls fired together, which cost two network
+ * round trips on every category switch -- the dominant cost of browsing a
+ * catalog on mobile data. The server returns both halves as one jsonb value.
+ */
+export async function fetchCategoryContent(
+  categoryId: string,
+): Promise<CategoryContent> {
+  const supabase = createServerClient();
+  const { data, error } = await supabase.rpc("get_category_content", {
+    p_user_id: await requireUserId(),
+    p_category_id: categoryId,
+  });
+  if (error) throw new Error(error.message);
+
+  const row = asJsonObject(data);
+  if (!row.category) return { products: [], photos: [] };
+
+  return {
+    products: asJsonArray(row.products).map(mapProduct),
+    photos: asJsonArray(row.photos).map(mapPhoto),
+  };
 }
 
 export async function fetchProducts(categoryId: string): Promise<Product[]> {

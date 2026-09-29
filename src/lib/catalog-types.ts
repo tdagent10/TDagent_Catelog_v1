@@ -1,4 +1,4 @@
-import { publicPhotoUrl } from "./supabase/server";
+import { publicPhotoUrl, publicPhotoUrlSized } from "./supabase/server";
 import type { GarmentSpec } from "@/components/catalog/product-image";
 
 export type Category = {
@@ -25,12 +25,55 @@ export type Product = {
 export type CatalogPhoto = {
   id: string;
   url: string;
+  /**
+   * Right-sized variants for `srcset`, so the phone downloads a card-sized
+   * image instead of the full ~200KB original. `url` stays as the full-size
+   * fallback and is what the optimistic preview and any zoom use.
+   */
+  srcSet: string;
   storagePath: string;
   bytes: number;
   width: number;
   height: number;
   takenAt: string;
 };
+
+/**
+ * Card aspect the grid renders at (CSS `aspect-[7/6]`), 7:6.
+ *
+ * The transform endpoint needs an explicit target box to avoid stretching the
+ * image, so this ratio is the one to request.
+ */
+const CARD_ASPECT = 7 / 6;
+
+/** Widths offered to the browser. Chosen for 2/3/4-column grids at DPR 1-3. */
+const SRCSET_WIDTHS = [240, 400, 640, 900];
+
+/**
+ * Builds a srcset of right-sized variants, never upscaling.
+ *
+ * A photo captured small is offered only up to its own width: asking for more
+ * would just transfer the same pixels twice.
+ */
+function buildSrcSet(
+  storagePath: string,
+  naturalWidth: number,
+): string {
+  const widths = SRCSET_WIDTHS.filter((w) => w < naturalWidth);
+  // Always offer at least the natural size, so there is a candidate at any DPR.
+  const sizes = widths.length > 0 ? widths : [naturalWidth];
+
+  return sizes
+    .map((w) => {
+      const url = publicPhotoUrlSized(
+        storagePath,
+        w,
+        Math.round(w / CARD_ASPECT),
+      );
+      return `${url} ${w}w`;
+    })
+    .join(", ");
+}
 
 /** Postgres returns bigint counts as strings over PostgREST. */
 function toCount(value: unknown): number {
@@ -91,12 +134,14 @@ export function mapProduct(row: Record<string, unknown>): Product {
 
 export function mapPhoto(row: Record<string, unknown>): CatalogPhoto {
   const storagePath = String(row.storage_path);
+  const width = toCount(row.width);
   return {
     id: String(row.id),
     url: publicPhotoUrl(storagePath),
+    srcSet: buildSrcSet(storagePath, width || 640),
     storagePath,
     bytes: toCount(row.bytes),
-    width: toCount(row.width),
+    width,
     height: toCount(row.height),
     takenAt: String(row.created_at),
   };

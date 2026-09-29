@@ -47,8 +47,14 @@ export function PhotoCard({
         {/* eslint-disable-next-line @next/next/no-img-element */}
         <img
           src={photo.url}
+          srcSet={photo.srcSet}
+          // 2 columns on a phone, 3 on tablet, 4 on desktop. Declaring this
+          // lets the browser pick from the srcset instead of taking the
+          // full-size src, which is the whole point of the variants.
+          sizes="(max-width: 640px) 48vw, (max-width: 1280px) 32vw, 24vw"
           alt="Captured product"
           loading="lazy"
+          decoding="async"
           className="aspect-[7/6] w-full object-cover"
         />
         {onRemove && (

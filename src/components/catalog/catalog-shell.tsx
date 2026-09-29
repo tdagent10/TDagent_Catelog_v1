@@ -15,12 +15,12 @@ import {
   deleteCategoryAction,
   deletePhotoAction,
   deleteProductAction,
-  fetchPhotos,
-  fetchProducts,
+  fetchCategoryContent,
   uploadPhotoAction,
   type CreateCategoryState,
 } from "@/app/actions/catalog";
 import { PendingPhotoCard, PhotoCard, ProductCard } from "./product-card";
+import type { CategoryContent } from "@/app/actions/catalog";
 import { CameraCapture } from "./camera-capture";
 import { ShareQrModal } from "./share-qr-modal";
 import { getMyShareToken } from "@/app/actions/share";
@@ -113,19 +113,44 @@ export function CatalogShell({
     initialCategories[0]?.id ?? null,
   );
 
-  // Photos are stored against the category they belong to, so a stale list can
-  // never be shown against a newly selected category.
-  const [photosState, setPhotosState] = useState<{
-    id: string;
-    list: CatalogPhoto[];
-  } | null>(null);
+  /**
+   * Category content cache, keyed by category id, and the single source of
+   * truth for what a category contains.
+   *
+   * Products and photos used to live in separate per-category state, which
+   * meant every mutation had to update a list AND survive the next re-seed
+   * from the network. Reading from one cache means a delete or a new capture
+   * cannot be silently undone by a later fetch.
+   *
+   * State rather than a ref: it is read while rendering, and React forbids
+   * reading a ref during render. Updates copy the Map, which is cheap at this
+   * size (one entry per category) and gives a fresh reference to re-render on.
+   */
+  const [contentCache, setContentCache] = useState<Map<string, CategoryContent>>(
+    () => new Map(),
+  );
 
-  // Same shape and same reason for products: they belong to a category, and
-  // these used to be a hardcoded constant with a client-side hide set.
-  const [productsState, setProductsState] = useState<{
-    id: string;
-    list: Product[];
-  } | null>(null);
+  /** Replaces a category's content. */
+  const writeCache = (id: string, content: CategoryContent) => {
+    setContentCache((prev) => {
+      if (prev.get(id) === content) return prev;
+      return new Map(prev).set(id, content);
+    });
+  };
+
+  /** Applies a change to one category's cached content. */
+  const patchCache = (
+    id: string,
+    patch: (content: CategoryContent) => CategoryContent,
+  ) => {
+    setContentCache((prev) => {
+      const existing = prev.get(id);
+      if (!existing) return prev;
+      const updated = patch(existing);
+      if (updated === existing) return prev;
+      return new Map(prev).set(id, updated);
+    });
+  };
 
   const [cameraOpen, setCameraOpen] = useState(false);
   const [captureError, setCaptureError] = useState<string | null>(null);
@@ -169,31 +194,38 @@ export function CatalogShell({
    * the screen never claims a product is gone while the database still has
    * it and it reappears at the next login.
    */
-  const removeProduct = useCallback(async (id: string) => {
-    const previous = productsState;
-    setProductsState((prev) =>
-      prev ? { ...prev, list: prev.list.filter((p) => p.id !== id) } : prev,
-    );
-    setCategories((prev) =>
-      prev.map((c) =>
-        c.id === activeId ? { ...c, productCount: Math.max(0, c.productCount - 1) } : c,
-      ),
-    );
+  const removeProduct = useCallback(
+    async (id: string) => {
+      if (!activeId) return;
+      const previous = contentCache.get(activeId);
+      if (!previous) return;
 
-    const res = await deleteProductAction(id);
-    if (!res.ok) {
-      console.error("deleteProduct failed:", res.error);
-      setProductsState(previous);
+      patchCache(activeId, (c) => ({
+        ...c,
+        products: c.products.filter((p) => p.id !== id),
+      }));
       setCategories((prev) =>
         prev.map((c) =>
           c.id === activeId
-            ? { ...c, productCount: c.productCount + 1 }
+            ? { ...c, productCount: Math.max(0, c.productCount - 1) }
             : c,
         ),
       );
-      setCaptureError(res.error ?? "Could not delete that product.");
-    }
-  }, [productsState, activeId]);
+
+      const res = await deleteProductAction(id);
+      if (!res.ok) {
+        console.error("deleteProduct failed:", res.error);
+        writeCache(activeId, previous);
+        setCategories((prev) =>
+          prev.map((c) =>
+            c.id === activeId ? { ...c, productCount: c.productCount + 1 } : c,
+          ),
+        );
+        setCaptureError(res.error ?? "Could not delete that product.");
+      }
+    },
+    [activeId, contentCache],
+  );
 
   // Always open the live-camera dialog first: it tries the real device camera
   // via getUserMedia (works on Windows, Android Chrome and iOS Safari over
@@ -242,17 +274,15 @@ export function CatalogShell({
     };
   }, []);
 
+  const activeContent = active ? contentCache.get(active.id) : undefined;
+
   const photos = readOnly
     ? (active ? (initialPhotos?.[active.id] ?? NO_PHOTOS) : NO_PHOTOS)
-    : active && photosState?.id === active.id
-      ? photosState.list
-      : NO_PHOTOS;
+    : (activeContent?.photos ?? NO_PHOTOS);
 
   const products = readOnly
     ? (active ? (initialProducts?.[active.id] ?? NO_PRODUCTS) : NO_PRODUCTS)
-    : active && productsState?.id === active.id
-      ? productsState.list
-      : NO_PRODUCTS;
+    : (activeContent?.products ?? NO_PRODUCTS);
 
   // Photos still uploading for the category on screen. Listed first so a new
   // capture is the first thing in the grid, ahead of anything already there.
@@ -261,41 +291,70 @@ export function CatalogShell({
       ? pendingPhotos.filter((p) => p.categoryId === active.id)
       : NO_PENDING;
 
-  // Products and photos for the selected category, fetched per selection.
-  // Skipped entirely in read-only mode: photos arrive preloaded and a customer
-  // view has no editing controls to trigger a product fetch.
+  /**
+   * Loads the selected category and warms its neighbours.
+   *
+   * One request for the category on screen, then the ones beside it are
+   * fetched while the browser is idle. Tapping through the sidebar is the
+   * normal way to use this screen, and on mobile data every uncached category
+   * is a visible wait -- prefetching makes those instant without paying for
+   * every category up front.
+   */
   useEffect(() => {
     if (!active || readOnly) return;
 
     let cancelled = false;
 
-    fetchPhotos(active.id)
-      .then((list) => {
-        if (!cancelled) setPhotosState({ id: active.id, list });
-      })
-      .catch((err) => {
-        console.error("fetchPhotos failed:", err);
-        if (!cancelled) {
-          setPhotosState({ id: active.id, list: NO_PHOTOS });
-          setCaptureError("Could not load photos for this category.");
-        }
-      });
+    // Ids already resolved, so a re-run caused by the cache itself changing
+    // does not re-fetch what it just stored.
+    const loaded = new Set(contentCache.keys());
 
-    fetchProducts(active.id)
-      .then((list) => {
-        if (!cancelled) setProductsState({ id: active.id, list });
-      })
-      .catch((err) => {
-        console.error("fetchProducts failed:", err);
-        if (!cancelled) {
-          setProductsState({ id: active.id, list: NO_PRODUCTS });
-        }
-      });
+    const load = (id: string) =>
+      fetchCategoryContent(id)
+        .then((content) => {
+          if (cancelled) return;
+          writeCache(id, content);
+        })
+        .catch((err) => {
+          console.error("fetchCategoryContent failed:", err);
+          if (cancelled || id !== active.id) return;
+          writeCache(id, { products: [], photos: [] });
+          setCaptureError("Could not load this category.");
+        });
+
+    if (!loaded.has(active.id)) {
+      load(active.id);
+    }
+
+    const index = categories.findIndex((c) => c.id === active.id);
+    const neighbours = [
+      categories[index - 1]?.id,
+      categories[index + 1]?.id,
+    ].filter((id): id is string => !!id && !loaded.has(id));
+
+    if (neighbours.length > 0) {
+      const warm = () => neighbours.forEach(load);
+      // Safari only picked up requestIdleCallback in 16.4, so the timeout path
+      // is still the common one on phones.
+      const idle = window.requestIdleCallback;
+      if (typeof idle === "function") {
+        const handle = idle(warm, { timeout: 2500 });
+        return () => {
+          cancelled = true;
+          window.cancelIdleCallback(handle);
+        };
+      }
+      const timer = window.setTimeout(warm, 400);
+      return () => {
+        cancelled = true;
+        window.clearTimeout(timer);
+      };
+    }
 
     return () => {
       cancelled = true;
     };
-  }, [active, readOnly]);
+  }, [active, readOnly, categories, contentCache]);
 
   const [addState, addFormAction] = useActionState<
     CreateCategoryState,
@@ -371,10 +430,10 @@ export function CatalogShell({
       // Replace the local preview with the stored photo.
       if (previewUrl) dropPending(pendingId);
 
-      setPhotosState((prev) => {
-        const base = prev?.id === categoryId ? prev.list : NO_PHOTOS;
-        return { id: categoryId, list: [result.photo, ...base] };
-      });
+      patchCache(categoryId, (c) => ({
+        ...c,
+        photos: [result.photo, ...c.photos],
+      }));
       setCategories((prev) =>
         prev.map((c) =>
           c.id === categoryId ? { ...c, photoCount: c.photoCount + 1 } : c,
@@ -399,18 +458,39 @@ export function CatalogShell({
     setPendingUploads(0);
   };
 
-  const removePhoto = useCallback((id: string) => {
-    setPhotosState((prev) =>
-      prev ? { ...prev, list: prev.list.filter((p) => p.id !== id) } : prev,
-    );
+  const removePhoto = useCallback(
+    (id: string) => {
+      if (!activeId) return;
+      const previous = contentCache.get(activeId);
+      if (!previous) return;
 
-    deletePhotoAction(id).then((res) => {
-      if (!res.ok) {
-        console.error("deletePhoto failed:", res.error);
-        setCaptureError(res.error ?? "Could not delete that photo.");
-      }
-    });
-  }, []);
+      patchCache(activeId, (c) => ({
+        ...c,
+        photos: c.photos.filter((p) => p.id !== id),
+      }));
+      setCategories((prev) =>
+        prev.map((c) =>
+          c.id === activeId
+            ? { ...c, photoCount: Math.max(0, c.photoCount - 1) }
+            : c,
+        ),
+      );
+
+      deletePhotoAction(id).then((res) => {
+        if (!res.ok) {
+          console.error("deletePhoto failed:", res.error);
+          writeCache(activeId, previous);
+          setCategories((prev) =>
+            prev.map((c) =>
+              c.id === activeId ? { ...c, photoCount: c.photoCount + 1 } : c,
+            ),
+          );
+          setCaptureError(res.error ?? "Could not delete that photo.");
+        }
+      });
+    },
+    [activeId, contentCache],
+  );
 
   // The count matches exactly what the grid below renders: products from the
   // database, plus captured photos, plus any still uploading.

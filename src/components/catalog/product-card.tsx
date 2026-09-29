@@ -65,3 +65,33 @@ export function PhotoCard({
     </li>
   );
 }
+
+/**
+ * A photo that is on screen before its upload has finished.
+ *
+ * Shown the moment the shutter fires so the tap registers instantly, then
+ * swapped for a real PhotoCard. Slightly dimmed with a "Saving" badge so it is
+ * never mistaken for a stored photo, and deliberately not deletable: there is
+ * no server-side id to delete yet.
+ */
+export function PendingPhotoCard({ url }: { url: string }) {
+  return (
+    <li className="min-w-0 overflow-hidden rounded-xl border border-card-border bg-white p-1.5 opacity-70 sm:p-2">
+      <div className="relative overflow-hidden rounded-lg bg-swatch-bg">
+        {/* eslint-disable-next-line @next/next/no-img-element */}
+        <img
+          src={url}
+          alt="Uploading photo"
+          className="aspect-[7/6] w-full object-cover"
+        />
+        <span className="absolute inset-x-0 bottom-0 flex items-center justify-center gap-1.5 bg-black/55 py-1.5 text-[11px] font-semibold text-white backdrop-blur-sm">
+          <span
+            aria-hidden="true"
+            className="h-2.5 w-2.5 animate-spin rounded-full border-2 border-white/35 border-t-white"
+          />
+          Saving
+        </span>
+      </div>
+    </li>
+  );
+}

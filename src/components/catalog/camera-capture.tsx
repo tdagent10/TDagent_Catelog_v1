@@ -13,7 +13,7 @@ type CameraFailure =
 type Props = {
   open: boolean;
   onClose: () => void;
-  onCapture: (source: Blob) => Promise<void> | void;
+  onCapture: (source: Blob | ImageBitmap) => Promise<void> | void;
   busy: boolean;
   error: string | null;
   /** Photos finished uploading in this session, shown in the counter. */
@@ -21,6 +21,9 @@ type Props = {
   /** Uploads still in flight, so Done can wait for them to land. */
   uploading: number;
 };
+
+/** Matches MAX_EDGE in image-compress: decode straight to final size. */
+const GRAB_MAX_EDGE = 1600;
 
 const FAILURE_TEXT: Record<CameraFailure, string> = {
   insecure:
@@ -233,8 +236,14 @@ export function CameraCapture({
    * Crops the grab to exactly the region the user framed.
    *
    * The preview is `object-cover`, so the visible rectangle is a centre-crop
-   * of the sensor frame. Drawing the raw frame instead would save a photo
+   * of the sensor frame. Capturing the raw frame instead would save a photo
    * containing scenery the user never saw and cut off what they aimed at.
+   *
+   * Returns an ImageBitmap, not a JPEG. The old path drew to a canvas and ran
+   * toBlob() at quality 0.92, and the compressor then decoded that and encoded
+   * it again -- two full-resolution encodes per photo. Decoding straight to a
+   * bitmap hands the encoder pixels it can use as-is, and the crop is
+   * downscaled during the decode rather than by a second drawImage.
    */
   const grab = () => {
     const video = videoRef.current;
@@ -250,48 +259,48 @@ export function CameraCapture({
     }
     setFlash(true);
 
-    try {
-      const vw = video.videoWidth;
-      const vh = video.videoHeight;
-      const box = video.getBoundingClientRect();
+    const vw = video.videoWidth;
+    const vh = video.videoHeight;
+    const box = video.getBoundingClientRect();
 
-      // object-cover scale: the larger of the two fit ratios.
-      const scale = Math.max(box.width / vw, box.height / vh) || 1;
-      const sourceWidth = box.width / scale;
-      const sourceHeight = box.height / scale;
-      const sourceX = (vw - sourceWidth) / 2;
-      const sourceY = (vh - sourceHeight) / 2;
+    // object-cover scale: the larger of the two fit ratios.
+    const scale = Math.max(box.width / vw, box.height / vh) || 1;
+    const sourceWidth = Math.max(1, Math.round(box.width / scale));
+    const sourceHeight = Math.max(1, Math.round(box.height / scale));
+    const sourceX = Math.max(0, Math.round((vw - sourceWidth) / 2));
+    const sourceY = Math.max(0, Math.round((vh - sourceHeight) / 2));
 
-      const canvas = document.createElement("canvas");
-      canvas.width = Math.round(sourceWidth);
-      canvas.height = Math.round(sourceHeight);
-      const ctx = canvas.getContext("2d");
-      if (!ctx) {
-        setDetail("This browser cannot read the camera frame. Try again.");
-        return;
-      }
-      ctx.drawImage(
+    // Cap at decode time: a 1080p bitmap is ~8MB to copy into the worker, and
+    // the encoder never keeps more than MAX_EDGE anyway.
+    const longest = Math.max(sourceWidth, sourceHeight);
+    const fit = longest > GRAB_MAX_EDGE ? GRAB_MAX_EDGE / longest : 1;
+
+    // Synchronous first, so the shutter never waits: a missing crop/scale
+    // option falls back to the whole frame rather than losing the photo.
+    const readFrame = (options?: ImageBitmapOptions) =>
+      createImageBitmap(
         video,
         sourceX,
         sourceY,
         sourceWidth,
         sourceHeight,
-        0,
-        0,
-        canvas.width,
-        canvas.height,
+        options,
       );
-      canvas.toBlob(
-        (blob) => {
-          if (blob) onCapture(blob);
-          else setDetail("Could not read the camera frame. Try again.");
-        },
-        "image/jpeg",
-        0.92,
-      );
-    } catch {
-      setDetail("Could not capture. Try again.");
-    }
+
+    readFrame(
+      fit < 1
+        ? {
+            resizeWidth: Math.max(1, Math.round(sourceWidth * fit)),
+            resizeHeight: Math.max(1, Math.round(sourceHeight * fit)),
+            resizeQuality: "high",
+          }
+        : undefined,
+    )
+      .catch(() => readFrame())
+      .then((bitmap) => onCapture(bitmap))
+      .catch(() => {
+        setDetail("Could not read the camera frame. Try again.");
+      });
   };
 
   const pick = (input: HTMLInputElement | null) => {

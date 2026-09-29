@@ -20,7 +20,7 @@ import {
   uploadPhotoAction,
   type CreateCategoryState,
 } from "@/app/actions/catalog";
-import { PhotoCard, ProductCard } from "./product-card";
+import { PendingPhotoCard, PhotoCard, ProductCard } from "./product-card";
 import { CameraCapture } from "./camera-capture";
 import { ShareQrModal } from "./share-qr-modal";
 import { getMyShareToken } from "@/app/actions/share";
@@ -28,6 +28,56 @@ import { CameraIcon, PlusIcon, QrIcon } from "./icons";
 
 const NO_PHOTOS: CatalogPhoto[] = [];
 const NO_PRODUCTS: Product[] = [];
+
+/** A photo visible in the grid while its upload is still running. */
+type PendingPhoto = {
+  id: string;
+  categoryId: string;
+  url: string;
+};
+
+const NO_PENDING: PendingPhoto[] = [];
+
+/** Preview edge for the optimistic thumbnail. Small: it is only a placeholder. */
+const PREVIEW_EDGE = 320;
+
+/**
+ * Renders a capture to a small JPEG blob for the optimistic thumbnail.
+ *
+ * A camera capture arrives as an ImageBitmap, which has no URL and cannot be
+ * put in an <img>. This is a separate, deliberately tiny encode -- so the
+ * thumbnail appears immediately without paying for the full-size one.
+ */
+async function renderPreview(source: Blob | ImageBitmap): Promise<Blob | null> {
+  if (typeof ImageBitmap === "undefined") return null;
+  const bitmap =
+    source instanceof ImageBitmap ? source : await createImageBitmap(source);
+
+  // The source bitmap is transferred to the compression worker, so it must not
+  // be closed here. Only a bitmap this function decoded itself is closed.
+  const ownsBitmap = !(source instanceof ImageBitmap);
+
+  try {
+    const scale = Math.min(1, PREVIEW_EDGE / Math.max(bitmap.width, bitmap.height));
+    const canvas = document.createElement("canvas");
+    canvas.width = Math.max(1, Math.round(bitmap.width * scale));
+    canvas.height = Math.max(1, Math.round(bitmap.height * scale));
+
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return null;
+    ctx.fillStyle = "#ffffff";
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+    ctx.drawImage(bitmap, 0, 0, canvas.width, canvas.height);
+
+    return await new Promise<Blob | null>((resolve) =>
+      canvas.toBlob(resolve, "image/jpeg", 0.7),
+    );
+  } catch {
+    return null;
+  } finally {
+    if (ownsBitmap) bitmap.close();
+  }
+}
 
 function AddSubmitButton() {
   const { pending } = useFormStatus();
@@ -158,6 +208,40 @@ export function CatalogShell({
   const active =
     categories.find((c) => c.id === activeId) ?? categories[0] ?? null;
 
+  /**
+   * Photos shown in the grid before their upload lands.
+   *
+   * Compressing and uploading a photo takes long enough that waiting for it
+   * before showing anything reads as a broken camera. The thumbnail is placed
+   * in the grid immediately from a local object URL, marked as saving, and
+   * swapped for the stored photo when the request completes.
+   */
+  const [pendingPhotos, setPendingPhotos] = useState<PendingPhoto[]>([]);
+
+  // Object URLs are a real leak if they outlive the page, so every one is
+  // revoked when its entry is replaced or removed.
+  const dropPending = (id: string) => {
+    setPendingPhotos((prev) => {
+      const target = prev.find((p) => p.id === id);
+      if (target) URL.revokeObjectURL(target.url);
+      return prev.filter((p) => p.id !== id);
+    });
+  };
+
+  // A ref, not a dependency: the unmount cleanup must revoke the URLs that are
+  // live at that moment, and a closure over the state would only ever see the
+  // empty array it captured on mount.
+  const pendingRef = useRef<PendingPhoto[]>([]);
+  useEffect(() => {
+    pendingRef.current = pendingPhotos;
+  }, [pendingPhotos]);
+
+  useEffect(() => {
+    return () => {
+      pendingRef.current.forEach((p) => URL.revokeObjectURL(p.url));
+    };
+  }, []);
+
   const photos = readOnly
     ? (active ? (initialPhotos?.[active.id] ?? NO_PHOTOS) : NO_PHOTOS)
     : active && photosState?.id === active.id
@@ -169,6 +253,13 @@ export function CatalogShell({
     : active && productsState?.id === active.id
       ? productsState.list
       : NO_PRODUCTS;
+
+  // Photos still uploading for the category on screen. Listed first so a new
+  // capture is the first thing in the grid, ahead of anything already there.
+  const pendingForActive =
+    !readOnly && active
+      ? pendingPhotos.filter((p) => p.categoryId === active.id)
+      : NO_PENDING;
 
   // Products and photos for the selected category, fetched per selection.
   // Skipped entirely in read-only mode: photos arrive preloaded and a customer
@@ -230,7 +321,7 @@ export function CatalogShell({
   // Photos taken during the current session, for the counter in the camera UI.
   const [sessionShots, setSessionShots] = useState(0);
 
-  async function handleCapture(source: Blob) {
+  async function handleCapture(source: Blob | ImageBitmap) {
     if (!active) return;
     // The category is pinned for the whole session: the camera covers the
     // screen, so it cannot change mid-session, but capture the id up front
@@ -238,6 +329,25 @@ export function CatalogShell({
     const categoryId = active.id;
     setCaptureError(null);
     setPendingUploads((n) => n + 1);
+
+    // Placeholder in the grid straight away. An ImageBitmap has no URL, so it
+    // is drawn to a small canvas for the preview only -- that is cheap compared
+    // with the encode we are about to do, and it is the difference between the
+    // shutter appearing to work and appearing to hang.
+    const pendingId = `pending-${crypto.randomUUID()}`;
+    let previewUrl: string | null = null;
+    try {
+      const preview = await renderPreview(source);
+      if (preview) {
+        previewUrl = URL.createObjectURL(preview);
+        setPendingPhotos((prev) => [
+          { id: pendingId, categoryId, url: previewUrl as string },
+          ...prev,
+        ]);
+      }
+    } catch {
+      // A missing preview is cosmetic; the upload still proceeds.
+    }
 
     try {
       const compressed = await compressToJpeg(source, MAX_PHOTO_BYTES);
@@ -253,9 +363,13 @@ export function CatalogShell({
       );
 
       if (!result.ok) {
+        if (previewUrl) dropPending(pendingId);
         setCaptureError(result.error);
         return;
       }
+
+      // Replace the local preview with the stored photo.
+      if (previewUrl) dropPending(pendingId);
 
       setPhotosState((prev) => {
         const base = prev?.id === categoryId ? prev.list : NO_PHOTOS;
@@ -271,6 +385,7 @@ export function CatalogShell({
       // taps Done, so several angles of one garment can be shot in a row.
     } catch (err) {
       console.error("handleCapture failed:", err);
+      if (previewUrl) dropPending(pendingId);
       setCaptureError("Could not process that photo.");
     } finally {
       setPendingUploads((n) => Math.max(0, n - 1));
@@ -298,8 +413,8 @@ export function CatalogShell({
   }, []);
 
   // The count matches exactly what the grid below renders: products from the
-  // database plus captured photos.
-  const displayedCount = products.length + photos.length;
+  // database, plus captured photos, plus any still uploading.
+  const displayedCount = products.length + photos.length + pendingForActive.length;
 
   return (
     <div className="min-h-dvh bg-canvas">
@@ -448,8 +563,11 @@ export function CatalogShell({
                 )}
               </div>
 
-              {products.length + photos.length > 0 ? (
+              {products.length + photos.length + pendingForActive.length > 0 ? (
                 <ul className="mt-4 grid grid-cols-2 gap-2.5 sm:mt-7 sm:grid-cols-3 sm:gap-5 xl:grid-cols-4">
+                  {pendingForActive.map((p) => (
+                    <PendingPhotoCard key={p.id} url={p.url} />
+                  ))}
                   {products.map((product) => (
                     <ProductCard
                       key={product.id}
